@@ -13,6 +13,7 @@ from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
+from slugify import slugify
 
 
 AJAX_ON_SUCCESS = '''
@@ -32,10 +33,9 @@ INIT_PLAYER = '$(document).audioPlayer({}, 0)'
 @contextlib.contextmanager
 def open_browser(url):
     """Open a web page with Selenium."""
-    if getattr(sys, 'frozen', False):
-        tmp_path = getattr(sys, '_MEIPASS')
-        os.environ['PATH'] += os.pathsep + tmp_path
-    browser = webdriver.Firefox()
+    profile = webdriver.FirefoxProfile()
+    profile.set_preference('permissions.default.image', 2)  # disable images
+    browser = webdriver.Firefox(firefox_profile=profile)
     browser.get(url)
     yield browser
     browser.close()
@@ -47,15 +47,22 @@ def get_book_id(html):
     return player.search(html).group(1)
 
 
-def get_playist(browser, book_id):
-    """Extract the playlist."""
+def scrape_chapters_meta(browser, book_id):
+    """Extract chapters metadata from the rendered page."""
     browser.execute_script(AJAX_ON_SUCCESS)
     browser.execute_script(INIT_PLAYER.format(book_id))
     playlist_loaded = EC.presence_of_element_located((By.ID, 'playlist'))
     element = WebDriverWait(browser, 60).until(playlist_loaded)
-    return tuple(
-        (track['mp3'], track['title']) for track in json.loads(element.text)
-    )
+    return json.loads(element.text)
+
+
+def get_playlist(audio_book_url):
+    """Return a playlist."""
+    with open_browser(audio_book_url) as browser:
+        book_id = get_book_id(browser.page_source)
+        chapters = scrape_chapters_meta(browser, book_id)
+    for track in chapters:
+        yield track['mp3'], slugify(track['title'])
 
 
 def download_chapter(url):
@@ -63,87 +70,74 @@ def download_chapter(url):
     return requests.get(url).content
 
 
-def get_audiobook_name(url):
+def get_book_title(url):
     """Extract the audiobook name from its URL."""
-    # TODO: sanitize the path
-    return url.split('/')[-1]
+    return slugify(url.split('/')[-1])
 
 
-def get_full_dirname(dirname, do_overwrite):
-    """
-    Return absolute path for dirname, and check for existence.
-    
-    If dirname exists and is not a directory - raise an exception.
-    If not empty - prompt before overwriting unless do_overwrite is True.
-    """
-    full_path_dir = os.path.abspath(dirname)
-
-    if os.path.exists(full_path_dir):
-        if not os.path.isdir(full_path_dir):
-            click.echo('\n{} exists, and is not a directory!\n'.format(
-                full_path_dir)
-            )
-            exit(1)
-        if os.listdir(full_path_dir) and not do_overwrite:
-            if not click.confirm('\nDirectory "{}" exists. Overwrite?'.format(full_path_dir)):
-                sys.exit(1)
-            else:
-                click.echo('Overwriting files in "{}"\n'.format(full_path_dir))
-    else:
-        click.echo('\nCreating directory "{}"'.format(full_path_dir))
-        # TODO: avoid side effects
-        os.makedirs(full_path_dir)
-    return full_path_dir
+def get_non_blank_path(*dirs):
+    """Return the first non-blank directory path."""
+    return os.path.abspath(next(filter(bool, dirs)))
 
 
-@click.command(context_settings=dict(help_option_names=['-h', '--help']))
+def get_or_create_output_dir(dirname, book_title):
+    """Create or reuse output directory in a fail-safe manner."""
+    path = get_non_blank_path(dirname, book_title, os.getcwd())
+    try:
+        os.makedirs(path, exist_ok=True)
+        return path
+    except FileExistsError:
+        raise TypeError('"{}" is not a directory.'.format(path))
+
+
+def contains_files(path):
+    """Return True if the directory is not empty."""
+    return bool(os.listdir(path))
+
+
+@click.command()
 @click.argument('audio_book_url')
 @click.option(
-    '-o', '--output_dir', 'output_dir', default=None,
-    help='Directory the audio book will be dowloaded to. '
-         'Default: <Audio Book Name>'
+    '-o', '--output-dir', 'output_dir', default=None,
+    help=('Download directory. Default: <audio-book-title>')
 )
 @click.option(
-    '-w', '--overwrite', 'do_overwrite', is_flag=True,
-    help='Overwrite existing audiobook directory without asking'
+    '-y', '--yes', 'force_overwrite', is_flag=True,
+    help='Overwrite existing files without a prompt.'
 )
 @click.option(
-    '-1', '--onefile', 'one_file', is_flag=True,
-    help='Write whole book in one file'
+    '-1', '--one-file', 'one_file', is_flag=True,
+    help='Merge all book chapters into one file.'
 )
-def downloader_main(output_dir, do_overwrite, one_file, audio_book_url):
-    """Download the book."""
-    if output_dir is None:
-        output_dir = get_audiobook_name(audio_book_url)
+def cli(audio_book_url, output_dir, force_overwrite, one_file):
+    """Download the complete book."""
+    book_title = get_book_title(audio_book_url)
+    try:
+        path = get_or_create_output_dir(output_dir, book_title)
+    except TypeError as exc:
+        click.echo(str(exc))
+        sys.exit(1)
 
-    full_path_dir = get_full_dirname(output_dir, do_overwrite)
+    if contains_files(path) and not force_overwrite:
+        msg = 'The directory "{}" is not empty. Overwite?'.format(path)
+        if not click.confirm(msg):
+            click.echo('Terminated.')
+            sys.exit(0)
 
-    msg = '\nDownloading audiobook\n from "{}"\n to "{}"\n'
-    click.echo(msg.format(audio_book_url, full_path_dir))
+    click.echo('Downloading "{}" to "{}"...'.format(audio_book_url, path))
 
-    with open_browser(audio_book_url) as browser:
-        book_id = get_book_id(browser.page_source)
-        playlist = get_playist(browser, book_id)
+    if one_file:
+        output_file = lambda _: open(os.path.join(path, book_title), 'ab')
+    else:
+        output_file = lambda fname: open(os.path.join(path, fname), 'wb')
 
-    for url, fname in playlist:
-        click.echo('Downloading chapter "{}"'.format(fname))
-        if one_file:
-            file_name_and_path = '{}.mp3'.format(
-                get_audiobook_name(os.path.join(full_path_dir, audio_book_url))
-            )
-            file_mode = 'ab'
-        else:
-            file_name_and_path = '{}.mp3'.format(
-                os.path.join(full_path_dir, fname)
-            )
-            file_mode = 'wb'
-        with open(file_name_and_path, file_mode) as outfile:
+    for url, fname in get_playlist(audio_book_url):
+        click.echo('Downloading chapter "{}"...'.format(fname))
+        with output_file(fname) as outfile:
             outfile.write(download_chapter(url))
 
     click.echo('All done!\n')
 
 
-# start the app
 if __name__ == '__main__':
-
-    downloader_main()
+    cli()
