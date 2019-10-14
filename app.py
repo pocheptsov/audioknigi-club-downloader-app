@@ -13,7 +13,7 @@ from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
-from slugify import slugify
+from pathvalidate import sanitize_filename
 
 
 AJAX_ON_SUCCESS = '''
@@ -62,7 +62,7 @@ def get_playlist(audio_book_url):
         book_id = get_book_id(browser.page_source)
         chapters = scrape_chapters_meta(browser, book_id)
     for track in chapters:
-        yield track['mp3'], slugify(track['title'])
+        yield track['mp3'], sanitize_filename(track['title'])
 
 
 def download_chapter(url):
@@ -72,7 +72,7 @@ def download_chapter(url):
 
 def get_book_title(url):
     """Extract the audiobook name from its URL."""
-    return slugify(url.split('/')[-1])
+    return sanitize_filename(url.split('/')[-1])
 
 
 def get_non_blank_path(*dirs):
